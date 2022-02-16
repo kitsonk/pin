@@ -46,20 +46,85 @@ interface NpmPackageDataAbbreviated {
   versions: Record<string, NpmVersionDataAbbreviated>;
 }
 
-/** Asynchronously fetches npm registry abbreviated package data for a given
- * package. */
-async function getPackage(pkg: string): Promise<NpmPackageDataAbbreviated> {
-  const res = await fetch(`https://registry.npmjs.org/${pkg}`, {
-    headers: {
-      accept: "application/vnd.npm.install-v1+json, application/json;q=0.9",
-    },
-  });
-  if (res.status !== 200) {
-    throw new Error(
-      `Received ${res.status} ${res.statusText} from npm registry.`,
-    );
+/** URL patterns of supported npm package registries which can be analyzed. */
+const PATTERNS = new Map([
+  [
+    "esm.sh",
+    new URLPattern(
+      "http{s}?://esm.sh/:org(@[^/]+)?/:pkg([^@/]+){@}?:ver?/:mod?",
+    ),
+  ],
+  [
+    "cdn.esm.sh",
+    new URLPattern(
+      "http{s}?://cdn.esm.sh/:regver(v[0-9]+)/:org(@[^/]+)?/:pkg([^@/]+)@:ver/:mod*",
+    ),
+  ],
+  [
+    "skypack.dev",
+    new URLPattern({
+      protocol: "https",
+      hostname: "cdn.skypack.dev",
+      pathname: "/:org(@[^/]+)?/:pkg([^@/]+){@}?:ver?/:mod?",
+      search: "*",
+    }),
+  ],
+]);
+const VERSION = "0.0.1";
+
+/** Identify npm packages in remote imports and parse out the package and
+ * the optional semver/version/tag. */
+function analyzeImports(
+  imports: string[],
+): [
+  deps: Map<string, Set<string>>,
+  parsed: Map<string, [pkg: string, ver: string]>,
+] {
+  const deps = new Map<string, Set<string>>();
+  const parsed = new Map<string, [string, string]>();
+
+  for (const dep of imports) {
+    for (const pattern of PATTERNS.values()) {
+      const match = pattern.exec(dep);
+      if (match) {
+        const pkg = match.pathname.groups.org
+          ? `${match.pathname.groups.org}/${match.pathname.groups.pkg}`
+          : match.pathname.groups.pkg;
+        const ver = match.pathname.groups.ver;
+        let vers;
+        if (deps.has(pkg)) {
+          vers = deps.get(pkg)!;
+        } else {
+          vers = new Set<string>();
+          deps.set(pkg, vers);
+        }
+        vers.add(ver);
+        parsed.set(dep, [pkg, ver]);
+        break;
+      }
+    }
   }
-  return res.json();
+  return [deps, parsed];
+}
+
+/** Given parsed and resolved dependencies, build an import map. */
+function buildImportMap(
+  parsed: Map<string, [string, string]>,
+  resolved: Map<string, Map<string, string>>,
+): ImportMap {
+  const importMap: ImportMap = { imports: {} };
+
+  for (const [key, [pkg, ver]] of parsed) {
+    const resolvedVersions = resolved.get(pkg);
+    if (resolvedVersions) {
+      const mappedVersion = resolvedVersions.get(ver);
+      if (mappedVersion) {
+        importMap.imports[key] = key.replace(ver, mappedVersion);
+      }
+    }
+  }
+
+  return importMap;
 }
 
 /** Given an module graph JSON structure, identify all the remote imports and
@@ -95,7 +160,48 @@ function extractRemoteImports(json: ModuleGraphJson): string[] {
   return [...imports];
 }
 
-const VERSION = "0.0.1";
+/** Asynchronously fetches npm registry abbreviated package data for a given
+ * package. */
+async function getPackage(pkg: string): Promise<NpmPackageDataAbbreviated> {
+  const res = await fetch(`https://registry.npmjs.org/${pkg}`, {
+    headers: {
+      accept: "application/vnd.npm.install-v1+json, application/json;q=0.9",
+    },
+  });
+  if (res.status !== 200) {
+    throw new Error(
+      `Received ${res.status} ${res.statusText} from npm registry.`,
+    );
+  }
+  return res.json();
+}
+
+/** Query the npm registry for package information and attempt to resolve the
+ * best match. */
+async function resolveNpmVersions(
+  deps: Map<string, Set<string>>,
+): Promise<Map<string, Map<string, string>>> {
+  const resolved = new Map<string, Map<string, string>>();
+
+  for (const [pkg, vers] of deps) {
+    const info = await getPackage(pkg);
+    const pkgVers = Object.keys(info.versions);
+    const resolvedVersions = new Map<string, string>();
+    for (const ver of vers) {
+      // if the version is a dist-tag, we will use the version, if the version
+      // appears to be a plain "pinned" version, we will actually follow the
+      // behavior of `npm i` which is to treat it as only a fixed major release
+      // allowing it to float.
+      const v = info["dist-tags"][ver] ?? /^\d/.test(ver) ? `^${ver}` : ver;
+      const resolved = semver.maxSatisfying(pkgVers, v, { loose: true });
+      if (resolved) {
+        resolvedVersions.set(ver, resolved);
+      }
+    }
+    resolved.set(pkg, resolvedVersions);
+  }
+  return resolved;
+}
 
 // logging to stderr so stdout can be piped
 console.error(`${colors.bold("pin")} - version ${VERSION}`);
@@ -106,7 +212,7 @@ const argv = parse(Deno.args, {
   },
 });
 
-const input = argv._[0];
+const [input] = argv._;
 
 if (!input) {
   console.error(
@@ -127,60 +233,11 @@ console.error(`${colors.green("Analyzing")} ${url.toString()}`);
 const graph = await createGraph(url.toString(), { cacheInfo, load });
 const json = graph.toJSON();
 
+// extract remote imports
 const imports = extractRemoteImports(json);
 
-/** URL patterns of supported npm package registries which can be analyzed. */
-const patterns = new Map([
-  [
-    "esm.sh",
-    new URLPattern(
-      "http{s}?://esm.sh/:org(@[^/]+)?/:pkg([^@/]+){@}?:ver?/:mod?",
-    ),
-  ],
-  [
-    "cdn.esm.sh",
-    new URLPattern(
-      "http{s}?://cdn.esm.sh/:regver(v[0-9]+)/:org(@[^/]+)?/:pkg([^@/]+)@:ver/:mod*",
-    ),
-  ],
-  [
-    "skypack.dev",
-    new URLPattern({
-      protocol: "https",
-      hostname: "cdn.skypack.dev",
-      pathname: "/:org(@[^/]+)?/:pkg([^@/]+){@}?:ver?/:mod?",
-      search: "*",
-    }),
-  ],
-]);
-
-// Identify npm packages in the remote dependencies parse out the package and
-// optional semver/version/tag.
-
-const deps = new Map<string, Set<string>>();
-const parsed = new Map<string, [string, string]>();
-
-for (const dep of imports) {
-  for (const pattern of patterns.values()) {
-    const match = pattern.exec(dep);
-    if (match) {
-      const pkg = match.pathname.groups.org
-        ? `${match.pathname.groups.org}/${match.pathname.groups.pkg}`
-        : match.pathname.groups.pkg;
-      const ver = match.pathname.groups.ver;
-      let vers;
-      if (deps.has(pkg)) {
-        vers = deps.get(pkg)!;
-      } else {
-        vers = new Set<string>();
-        deps.set(pkg, vers);
-      }
-      vers.add(ver);
-      parsed.set(dep, [pkg, ver]);
-      break;
-    }
-  }
-}
+// identify and parse out npm packages and versions from imports
+const [deps, parsed] = analyzeImports(imports);
 
 if (deps.size) {
   console.error(
@@ -190,48 +247,14 @@ if (deps.size) {
   );
 }
 
-// Query the npm registry for package information and attempt to resolve the
-// best match. Versions that
+// resolve the npm version with the npm registry
+const resolved = await resolveNpmVersions(deps);
 
-const infos = new Map<string, NpmPackageDataAbbreviated>();
-const resolved = new Map<string, Map<string, string>>();
-
-for (const [pkg, vers] of deps) {
-  const info = await getPackage(pkg);
-  infos.set(pkg, await getPackage(pkg));
-  const pkgVers = Object.keys(info.versions);
-  const resolvedVersions = new Map<string, string>();
-  for (const ver of vers) {
-    // if the version is a dist-tag, we will use the version, if the version
-    // appears to be a plain "pinned" version, we will actually follow the
-    // behavior of `npm i` which is to treat it as only a fixed major release
-    // allowing it to float.
-    const v = info["dist-tags"][ver] ?? /^\d/.test(ver) ? `^${ver}` : ver;
-    const resolved = semver.maxSatisfying(pkgVers, v, { loose: true });
-    if (resolved) {
-      resolvedVersions.set(ver, resolved);
-    }
-  }
-  resolved.set(pkg, resolvedVersions);
-}
-
-// now generate the import map
-const importMap: ImportMap = { imports: {} };
-
-for (const [key, [pkg, ver]] of parsed) {
-  const resolvedVersions = resolved.get(pkg);
-  if (resolvedVersions) {
-    const mappedVersion = resolvedVersions.get(ver);
-    if (mappedVersion) {
-      importMap.imports[key] = key.replace(ver, mappedVersion);
-    }
-  }
-}
+// generate the import map
+const importMap = buildImportMap(parsed, resolved);
 
 // output the import map
-
 const output = argv["output"];
-
 if (output) {
   await Deno.writeTextFile(output, JSON.stringify(importMap, undefined, "  "));
 } else {
