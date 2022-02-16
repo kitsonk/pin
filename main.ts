@@ -254,7 +254,7 @@ const resolved = await resolveNpmVersions(deps);
 const importMap = buildImportMap(parsed, resolved);
 
 // output the import map
-const output = argv["output"];
+const { output } = argv;
 if (output) {
   await Deno.writeTextFile(output, JSON.stringify(importMap, undefined, "  "));
 } else {
