@@ -26,6 +26,13 @@ Deno in your path you can just do:
 > deno info --import-map import-map.json examples/esm-sh.ts
 ```
 
+Or you can do it like:
+
+```
+> deno run -A https://raw.githubusercontent.com/kitsonk/pin/main/main.ts -o import-map.json https://raw.githubusercontent.com/kitsonk/pin/main/examples/esm-sh.ts
+> deno info --import-map import-map.json https://raw.githubusercontent.com/kitsonk/pin/main/examples/esm-sh.ts
+```
+
 ## Things to do
 
 This proof-of-concept is very limited at the moment. There are several things
