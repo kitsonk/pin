@@ -15,6 +15,15 @@ The core concepts of the utility are:
   the aggregate dependencies, meaning transient dependencies can easily be
   duplicated, or a "top level" dependency can be one version and a transient
   dependency can be another version.
+- It has become common place in Deno applications to use a specific version of a
+  dependency. This is the root cause of the "duplicate-module" problem. If you
+  were to use pinned versions in your `package.json`, a Node.js would have a
+  similar problem, as the dependencies would be duplicated in the graph. The POC
+  takes the approach that `npm` and other package managers take. For example if
+  you were to install `npm i react@17.0.1` the entry in the `package.json` would
+  actually be `"react": "^17.0.1"`. So this POC prepends `^` to a bare version.
+  If a user really wants to pin a version, they would need to do an import like:
+  `https://esm.sh/react@=17.0.1`, and we would leave it alone.
 
 ## Usage
 
@@ -43,8 +52,13 @@ that it should do:
   get a unique entry.
 - Populate the `"scopes"` of the import map. Currently the `"imports"` is only
   the top level external imports. When dealing with individual modules and
-  resolving the minimum acceptable graph, there is need to provide this.
+  resolving the minimum acceptable dependency graph, there is need to provide
+  this.
 - Be able to consume an "upstream" import map and output a modified one.
+- Consume an already existing "pinned" import map, only updating dependencies as
+  needed, so that it behaves more like a lockfile. Currently, rebuilding is like
+  if you deleted your local lockfile, not considering already "pinned"
+  dependencies.
 
 There are also things that we should consider more widely:
 
